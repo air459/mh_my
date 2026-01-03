@@ -1,0 +1,528 @@
+"""
+B站自动登录、三连和转发脚本
+需要安装的库：
+pip install selenium pillow qrcode numpy requests
+pip install selenium-wire (用于网络请求监控)
+"""
+
+import os
+import json
+import time
+import random
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+import logging
+from datetime import datetime
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("bilibili_auto.log", encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger(__name__)
+
+
+class BilibiliAuto:
+    def __init__(self, headless=False):
+        """初始化浏览器驱动"""
+        self.cookies_file = "bilibili_cookies.json"
+        self.driver = None
+        self.wait = None
+        self.is_logged_in = False
+
+        # 设置Chrome选项
+        self.chrome_options = Options()
+
+        if headless:
+            self.chrome_options.add_argument("--headless")
+
+        # 添加一些常用参数
+        self.chrome_options.add_argument(
+            "--disable-blink-features=AutomationControlled"
+        )
+        self.chrome_options.add_argument("--disable-gpu")
+        self.chrome_options.add_argument("--no-sandbox")
+        self.chrome_options.add_argument("--disable-dev-shm-usage")
+        self.chrome_options.add_argument("--window-size=1920,1080")
+        self.chrome_options.add_argument(
+            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+
+        # 移除自动化控制特征
+        self.chrome_options.add_experimental_option(
+            "excludeSwitches", ["enable-automation"]
+        )
+        self.chrome_options.add_experimental_option("useAutomationExtension", False)
+
+    def init_driver(self):
+        """初始化WebDriver"""
+        try:
+            # 尝试使用已安装的ChromeDriver
+            from selenium.webdriver.chrome.service import Service
+
+            service = Service()
+            self.driver = webdriver.Chrome(service=service, options=self.chrome_options)
+
+            # 执行CDP命令来规避检测
+            self.driver.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {
+                    "source": """
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined
+                    });
+                """
+                },
+            )
+
+            self.wait = WebDriverWait(self.driver, 20)
+            logger.info("浏览器驱动初始化成功")
+            return True
+
+        except Exception as e:
+            logger.error(f"初始化浏览器驱动失败: {e}")
+            return False
+
+    def load_cookies(self):
+        """加载保存的cookies"""
+        if os.path.exists(self.cookies_file):
+            try:
+                with open(self.cookies_file, "r", encoding="utf-8") as f:
+                    cookies = json.load(f)
+                return cookies
+            except Exception as e:
+                logger.error(f"加载cookies失败: {e}")
+        return None
+
+    def save_cookies(self):
+        """保存当前cookies到文件"""
+        try:
+            cookies = self.driver.get_cookies()
+            with open(self.cookies_file, "w", encoding="utf-8") as f:
+                json.dump(cookies, f, ensure_ascii=False, indent=2)
+            logger.info(f"Cookies已保存到 {self.cookies_file}")
+            return True
+        except Exception as e:
+            logger.error(f"保存cookies失败: {e}")
+            return False
+
+    def login_with_qrcode(self):
+        """通过二维码登录"""
+        try:
+            # 打开B站首页
+            self.driver.get("https://www.bilibili.com")
+            time.sleep(3)
+
+            # 点击登录按钮
+            login_btn = self.wait.until(
+                EC.element_to_be_clickable((By.CLASS_NAME, "header-login-entry"))
+            )
+            login_btn.click()
+            logger.info("点击登录按钮")
+            time.sleep(2)
+
+            # 切换到二维码登录
+            try:
+                qrcode_tab = self.driver.find_element(By.CLASS_NAME, "tab__qrcode")
+                qrcode_tab.click()
+                logger.info("切换到二维码登录")
+                time.sleep(2)
+            except:
+                logger.info("已在二维码登录页面")
+
+            # 获取二维码图片
+            qrcode_img = self.wait.until(
+                EC.presence_of_element_located((By.CLASS_NAME, "qrcode-img"))
+            )
+
+            logger.info("请扫描二维码登录...")
+            logger.info("等待登录中...")
+
+            # 等待登录完成（检测是否跳转到首页）
+            login_success = False
+            for i in range(120):  # 最多等待2分钟
+                try:
+                    # 检查是否登录成功（通过检查用户头像等元素）
+                    user_avatar = self.driver.find_elements(
+                        By.CLASS_NAME, "header-avatar"
+                    )
+                    if user_avatar:
+                        logger.info("登录成功！")
+                        login_success = True
+                        break
+
+                    # 或者检查URL是否发生变化
+                    current_url = self.driver.current_url
+                    if "bilibili.com" in current_url and "/login" not in current_url:
+                        logger.info("登录成功！")
+                        login_success = True
+                        break
+
+                except:
+                    pass
+
+                time.sleep(1)
+                if i % 10 == 0:
+                    logger.info(f"等待登录中... ({i}秒)")
+
+            if login_success:
+                # 保存cookies
+                self.save_cookies()
+                self.is_logged_in = True
+                return True
+            else:
+                logger.error("登录超时")
+                return False
+
+        except Exception as e:
+            logger.error(f"二维码登录失败: {e}")
+            return False
+
+    def check_login_status(self):
+        """检查登录状态"""
+        try:
+            # 先尝试用已有cookies
+            cookies = self.load_cookies()
+            if cookies:
+                # 先打开B站首页
+                self.driver.get("https://www.bilibili.com")
+                time.sleep(2)
+
+                # 添加cookies
+                for cookie in cookies:
+                    try:
+                        self.driver.add_cookie(cookie)
+                    except:
+                        continue
+
+                # 刷新页面
+                self.driver.refresh()
+                time.sleep(3)
+
+                # 检查是否登录成功
+                try:
+                    # 尝试查找用户相关元素
+                    user_elements = self.driver.find_elements(
+                        By.CLASS_NAME, "header-avatar"
+                    )
+                    if user_elements:
+                        logger.info("Cookies登录成功")
+                        self.is_logged_in = True
+                        return True
+                except:
+                    pass
+
+            # 如果cookies登录失败，使用二维码登录
+            logger.info("使用二维码登录...")
+            return self.login_with_qrcode()
+
+        except Exception as e:
+            logger.error(f"检查登录状态失败: {e}")
+            return False
+
+    def get_random_video(self):
+        """随机获取一个视频"""
+        try:
+            # 打开推荐页面
+            self.driver.get("https://www.bilibili.com")
+            time.sleep(3)
+
+            # 随机选择视频类别
+            categories = [
+                "热门",
+                "动画",
+                "音乐",
+                "舞蹈",
+                "游戏",
+                "知识",
+                "科技",
+                "运动",
+                "生活",
+                "美食",
+                "动物圈",
+            ]
+            random_category = random.choice(categories)
+
+            logger.info(f"尝试获取{random_category}类别的视频")
+
+            # 尝试查找视频
+            max_attempts = 5
+            for attempt in range(max_attempts):
+                try:
+                    # 查找视频卡片
+                    video_elements = self.driver.find_elements(
+                        By.CLASS_NAME, "video-card"
+                    )
+                    if not video_elements:
+                        video_elements = self.driver.find_elements(
+                            By.CLASS_NAME, "bili-video-card"
+                        )
+
+                    if video_elements:
+                        # 随机选择一个视频
+                        video_element = random.choice(
+                            video_elements[:20]
+                        )  # 限制在前20个
+
+                        # 获取视频链接
+                        try:
+                            link_element = video_element.find_element(By.TAG_NAME, "a")
+                            video_url = link_element.get_attribute("href")
+                            if video_url and "video/BV" in video_url:
+                                logger.info(f"找到随机视频: {video_url}")
+                                return video_url
+                        except:
+                            continue
+
+                    # 如果没有找到，滚动页面
+                    self.driver.execute_script("window.scrollBy(0, 500);")
+                    time.sleep(2)
+
+                except Exception as e:
+                    logger.error(f"第{attempt + 1}次尝试获取视频失败: {e}")
+
+            # 如果上述方法失败，使用备选方法
+            backup_urls = [
+                "https://www.bilibili.com/video/BV1GJ411x7h7",  # 示例视频
+                "https://www.bilibili.com/video/BV1vs411M7mT",
+                "https://www.bilibili.com/video/BV1b7411N7Je",
+            ]
+
+            random_video = random.choice(backup_urls)
+            logger.info(f"使用备选视频: {random_video}")
+            return random_video
+
+        except Exception as e:
+            logger.error(f"获取随机视频失败: {e}")
+            # 返回一个默认视频
+            return "https://www.bilibili.com/video/BV1GJ411x7h7"
+
+    def perform_sanlian(self, video_url):
+        """对视频进行三连（点赞、投币、收藏）"""
+        try:
+            # 打开视频页面
+            self.driver.get(video_url)
+            time.sleep(5)
+
+            # 等待页面加载完成
+            time.sleep(3)
+
+            # 1. 点赞
+            try:
+                like_button = self.wait.until(
+                    EC.element_to_be_clickable((By.CLASS_NAME, "like"))
+                )
+                like_button.click()
+                logger.info("已点赞")
+                time.sleep(1)
+            except Exception as e:
+                logger.warning(f"点赞失败: {e}")
+
+            # 2. 投币
+            try:
+                # 先点击投币按钮
+                coin_button = self.wait.until(
+                    EC.element_to_be_clickable((By.CLASS_NAME, "coin"))
+                )
+                coin_button.click()
+                time.sleep(2)
+
+                # 尝试点击确认投币2个
+                try:
+                    coin_options = self.driver.find_elements(
+                        By.CLASS_NAME, "bpui-radio"
+                    )
+                    if len(coin_options) >= 2:
+                        coin_options[1].click()  # 选择投2个币
+                        time.sleep(1)
+                except:
+                    pass
+
+                # 确认投币
+                confirm_buttons = self.driver.find_elements(
+                    By.CLASS_NAME, "bpui-button"
+                )
+                for btn in confirm_buttons:
+                    if "确定" in btn.text or "投币" in btn.text:
+                        btn.click()
+                        logger.info("已投币")
+                        break
+                time.sleep(1)
+            except Exception as e:
+                logger.warning(f"投币失败: {e}")
+
+            # 3. 收藏
+            try:
+                favorite_button = self.wait.until(
+                    EC.element_to_be_clickable((By.CLASS_NAME, "collect"))
+                )
+                favorite_button.click()
+                time.sleep(2)
+
+                # 如果出现收藏夹选择，选择第一个收藏夹
+                try:
+                    favorite_folders = self.driver.find_elements(
+                        By.CLASS_NAME, "fav-folder"
+                    )
+                    if favorite_folders:
+                        favorite_folders[0].click()
+                        time.sleep(1)
+                except:
+                    pass
+
+                # 确认收藏
+                confirm_buttons = self.driver.find_elements(
+                    By.CLASS_NAME, "bpui-button"
+                )
+                for btn in confirm_buttons:
+                    if "确定" in btn.text or "收藏" in btn.text:
+                        btn.click()
+                        logger.info("已收藏")
+                        break
+                time.sleep(1)
+            except Exception as e:
+                logger.warning(f"收藏失败: {e}")
+
+            logger.info("三连操作完成")
+            return True
+
+        except Exception as e:
+            logger.error(f"三连操作失败: {e}")
+            return False
+
+    def share_to_user(self, username="唐济人"):
+        """转发给指定用户"""
+        try:
+            # 1. 点击分享按钮
+            share_button = self.wait.until(
+                EC.element_to_be_clickable((By.CLASS_NAME, "share"))
+            )
+            share_button.click()
+            logger.info("点击分享按钮")
+            time.sleep(2)
+
+            # 2. 点击转发到动态
+            try:
+                forward_buttons = self.driver.find_elements(
+                    By.CLASS_NAME, "share-forward"
+                )
+                for btn in forward_buttons:
+                    if "转发" in btn.text or "转发到动态" in btn.text:
+                        btn.click()
+                        logger.info("点击转发到动态")
+                        time.sleep(2)
+                        break
+            except:
+                logger.warning("未找到转发到动态按钮，尝试其他方式")
+
+            # 3. 输入@用户
+            try:
+                # 查找输入框
+                input_areas = self.driver.find_elements(By.TAG_NAME, "textarea")
+                for textarea in input_areas:
+                    try:
+                        textarea.click()
+                        time.sleep(1)
+                        textarea.send_keys(f"@{username} ")
+                        logger.info(f"已@用户: {username}")
+                        time.sleep(2)
+                        break
+                    except:
+                        continue
+            except Exception as e:
+                logger.warning(f"@用户失败: {e}")
+
+            # 4. 点击发布
+            try:
+                publish_buttons = self.driver.find_elements(By.CLASS_NAME, "submit")
+                for btn in publish_buttons:
+                    if "发布" in btn.text or "转发" in btn.text:
+                        btn.click()
+                        logger.info("已发布转发")
+                        time.sleep(3)
+                        return True
+            except:
+                pass
+
+            logger.warning("转发操作可能未完全成功")
+            return False
+
+        except Exception as e:
+            logger.error(f"转发操作失败: {e}")
+            return False
+
+    def run(self):
+        """主运行函数"""
+        try:
+            # 1. 初始化浏览器
+            if not self.init_driver():
+                return False
+
+            # 2. 检查登录状态
+            if not self.check_login_status():
+                logger.error("登录失败")
+                return False
+
+            # 3. 获取随机视频
+            video_url = self.get_random_video()
+            if not video_url:
+                logger.error("获取视频失败")
+                return False
+
+            # 4. 三连操作
+            if not self.perform_sanlian(video_url):
+                logger.warning("三连操作可能不完整")
+
+            # 5. 转发给指定用户
+            if not self.share_to_user("唐济人"):
+                logger.warning("转发操作可能不完整")
+
+            # 6. 保存cookies
+            self.save_cookies()
+
+            logger.info("任务完成！")
+            return True
+
+        except Exception as e:
+            logger.error(f"运行过程中出错: {e}")
+            return False
+
+        finally:
+            # 延迟关闭浏览器以便查看结果
+            if self.driver:
+                logger.info("10秒后关闭浏览器...")
+                time.sleep(10)
+                self.driver.quit()
+
+
+def main():
+    """主函数"""
+    print("=" * 50)
+    print("B站自动三连转发脚本")
+    print("=" * 50)
+
+    # 创建实例并运行
+    auto_bot = BilibiliAuto(headless=False)  # 设置为True可在后台运行
+
+    success = auto_bot.run()
+
+    if success:
+        print("\n✓ 脚本执行成功！")
+    else:
+        print("\n✗ 脚本执行失败，请查看日志文件")
+
+    input("\n按Enter键退出...")
+
+
+if __name__ == "__main__":
+    main()

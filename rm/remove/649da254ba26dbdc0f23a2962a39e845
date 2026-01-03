@@ -1,0 +1,25 @@
+#include <pybind11/embed.h>  // 用于嵌入Python
+#include <iostream>
+
+namespace py = pybind11;
+
+int main() {
+    // 启动Python解释器
+    py::scoped_interpreter guard{};
+    
+    // 执行Python代码
+    py::exec("print('Hello from pybind11!')");
+    
+    // 导入模块
+    py::module sys = py::module::import("sys");
+    std::cout << "Python version: " 
+              << sys.attr("version").cast<std::string>() << std::endl;
+    
+    // 调用Python函数
+    py::module calc = py::module::import("calculator");
+    int result = calc.attr("add")(10, 20).cast<int>();
+    std::cout << "10 + 20 = " << result << std::endl;
+    
+    return 0;
+}
+

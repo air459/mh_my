@@ -1,0 +1,458 @@
+// smart_memory_bomber_70.cpp
+#include <iostream>
+#include <vector>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <cstdlib>
+#include <cstdio>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <csignal>
+#include <mutex>
+#include <fstream>
+#include <iomanip>
+#include <cmath>
+#include <algorithm>
+#include <random>
+
+std::mutex g_mutex;
+const int TARGET_PERCENT = 87;  // 目标内存使用率70%
+const double TOLERANCE = 0.1;   // 容差范围 ±5%
+
+// PID控制器结构
+struct PIDController {
+    double Kp = 1.0;    // 比例系数
+    double Ki = 0.1;    // 积分系数
+    double Kd = 0.01;   // 微分系数
+    
+    double setpoint = TARGET_PERCENT;  // 设定点
+    double integral = 0.0;            // 积分项
+    double prev_error = 0.0;          // 上一次误差
+    double output = 0.0;              // 输出
+    
+    // 计算PID输出
+    double calculate(double current, double dt) {
+        double error = setpoint - current;
+        
+        // 积分项
+        integral += error * dt;
+        
+        // 微分项
+        double derivative = (error - prev_error) / dt;
+        
+        // PID输出
+        output = Kp * error + Ki * integral + Kd * derivative;
+        
+        // 限制积分项防止windup
+        if (integral > 100.0) integral = 100.0;
+        if (integral < -100.0) integral = -100.0;
+        
+        prev_error = error;
+        return output;
+    }
+};
+
+// 内存信息结构
+struct MemoryInfo {
+    long long total = 0;      // 总内存
+    long long free = 0;       // 空闲内存
+    long long available = 0;  // 可用内存
+    long long cached = 0;     // 缓存
+    long long buffers = 0;    // 缓冲区
+    
+    double usage_percent = 0.0;  // 使用率百分比
+    
+    // 从/proc/meminfo读取
+    bool read() {
+        std::ifstream meminfo("/proc/meminfo");
+        if (!meminfo.is_open()) return false;
+        
+        std::string line;
+        while (getline(meminfo, line)) {
+            if (line.find("MemTotal:") == 0) {
+                total = parse_mem_value(line.substr(9));
+            } else if (line.find("MemFree:") == 0) {
+                free = parse_mem_value(line.substr(8));
+            } else if (line.find("MemAvailable:") == 0) {
+                available = parse_mem_value(line.substr(13));
+            } else if (line.find("Cached:") == 0) {
+                cached = parse_mem_value(line.substr(7));
+            } else if (line.find("Buffers:") == 0) {
+                buffers = parse_mem_value(line.substr(8));
+            }
+        }
+        
+        meminfo.close();
+        
+        if (total > 0) {
+            usage_percent = 100.0 * (1.0 - (double)available / total);
+        }
+        
+        return true;
+    }
+    
+private:
+    long long parse_mem_value(const std::string& str) {
+        std::string value = str;
+        // 移除空格和"kB"
+        value.erase(std::remove(value.begin(), value.end(), ' '), value.end());
+        value.erase(std::remove(value.begin(), value.end(), 'k'), value.end());
+        value.erase(std::remove(value.begin(), value.end(), 'B'), value.end());
+        return std::stoll(value);
+    }
+};
+
+// 智能内存分配器
+class SmartMemoryAllocator {
+private:
+    std::vector<char*> allocated_blocks;
+    std::atomic<long long> total_allocated{0};
+    std::atomic<bool> running{true};
+    std::thread allocator_thread;
+    PIDController pid;
+    double adjustment_factor = 1.0;
+    int min_chunk_mb = 10;    // 最小分配块
+    int max_chunk_mb = 512;   // 最大分配块
+    int current_chunk_mb = 100;
+    int allocation_interval_ms = 1000;  // 分配间隔
+    
+public:
+    SmartMemoryAllocator() {
+        allocator_thread = std::thread(&SmartMemoryAllocator::run, this);
+    }
+    
+    ~SmartMemoryAllocator() {
+        stop();
+        if (allocator_thread.joinable()) {
+            allocator_thread.join();
+        }
+        cleanup();
+    }
+    
+    void stop() {
+        running = false;
+    }
+    
+    void run() {
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::normal_distribution<> delay_dist(0.8, 0.2);  // 正态分布延迟
+        
+        while (running) {
+            // 读取当前内存状态
+            MemoryInfo mem;
+            if (!mem.read()) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                continue;
+            }
+            
+            // PID控制计算调整因子
+            adjustment_factor = pid.calculate(mem.usage_percent, 1.0);
+            
+            // 计算目标块大小
+            calculate_chunk_size(mem.usage_percent);
+            
+            // 决定是分配还是释放
+            if (should_allocate(mem.usage_percent)) {
+                allocate_memory();
+            } else if (should_deallocate(mem.usage_percent)) {
+                deallocate_memory();
+            }
+            
+            // 显示状态
+            if (std::chrono::steady_clock::now().time_since_epoch().count() % 5 == 0) {
+                show_status(mem);
+            }
+            
+            // 动态调整间隔
+            int interval = static_cast<int>(allocation_interval_ms * delay_dist(gen));
+            interval = std::max(100, std::min(5000, interval));  // 限制在100-5000ms
+            
+            std::this_thread::sleep_for(std::chrono::milliseconds(interval));
+        }
+    }
+    
+private:
+    bool should_allocate(double usage) {
+        if (usage < TARGET_PERCENT - TOLERANCE) {
+            return true;
+        }
+        return false;
+    }
+    
+    bool should_deallocate(double usage) {
+        if (usage > TARGET_PERCENT + TOLERANCE) {
+            return true;
+        }
+        return false;
+    }
+    
+    void calculate_chunk_size(double usage) {
+        // 根据与目标值的距离计算块大小
+        double distance = std::abs(usage - TARGET_PERCENT);
+        
+        if (distance > 20.0) {
+            // 距离大，使用大块快速调整
+            current_chunk_mb = max_chunk_mb;
+        } else if (distance > 10.0) {
+            // 中等距离
+            current_chunk_mb = (min_chunk_mb + max_chunk_mb) / 2;
+        } else if (distance > 5.0) {
+            // 接近目标，使用小块
+            current_chunk_mb = std::max(min_chunk_mb, max_chunk_mb / 4);
+        } else {
+            // 在目标范围内，使用最小块维持
+            current_chunk_mb = min_chunk_mb;
+        }
+        
+        // 根据调整因子微调
+        current_chunk_mb = static_cast<int>(current_chunk_mb * (1.0 + adjustment_factor * 0.1));
+        current_chunk_mb = std::max(min_chunk_mb, std::min(max_chunk_mb, current_chunk_mb));
+    }
+    
+    void allocate_memory() {
+        size_t chunk_size = current_chunk_mb * 1024ULL * 1024ULL;
+        
+        char* block = new (std::nothrow) char[chunk_size];
+        if (block) {
+            // 写入数据确保占用物理内存
+            memset(block, 0xAA, chunk_size);
+            
+            allocated_blocks.push_back(block);
+            total_allocated += chunk_size;
+            
+            std::lock_guard<std::mutex> lock(g_mutex);
+            std::cout << "\033[1;32m[分配] " << current_chunk_mb << "MB, 总计: " 
+                     << (total_allocated.load() / (1024*1024)) << " MB\033[0m" << std::endl;
+        } else {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            std::cout << "\033[1;31m[错误] 无法分配 " << current_chunk_mb << "MB 内存\033[0m" << std::endl;
+        }
+    }
+    
+    void deallocate_memory() {
+        if (!allocated_blocks.empty()) {
+            char* block = allocated_blocks.back();
+            allocated_blocks.pop_back();
+            
+            size_t chunk_size = current_chunk_mb * 1024ULL * 1024ULL;
+            total_allocated -= chunk_size;
+            
+            delete[] block;
+            
+            std::lock_guard<std::mutex> lock(g_mutex);
+            std::cout << "\033[1;33m[释放] " << current_chunk_mb << "MB, 剩余: " 
+                     << (total_allocated.load() / (1024*1024)) << " MB\033[0m" << std::endl;
+        }
+    }
+    
+    void cleanup() {
+        for (char* block : allocated_blocks) {
+            delete[] block;
+        }
+        allocated_blocks.clear();
+        total_allocated = 0;
+    }
+    
+    void show_status(const MemoryInfo& mem) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        
+        std::cout << "\n\033[1;36m" << std::string(50, '=') << "\033[0m" << std::endl;
+        std::cout << "\033[1;36m           智能内存控制器状态           \033[0m" << std::endl;
+        std::cout << "\033[1;36m" << std::string(50, '=') << "\033[0m" << std::endl;
+        
+        std::cout << std::fixed << std::setprecision(1);
+        std::cout << "目标使用率: " << TARGET_PERCENT << "%" << std::endl;
+        std::cout << "当前使用率: " << mem.usage_percent << "%" << std::endl;
+        std::cout << "误差: " << (mem.usage_percent - TARGET_PERCENT) << "%" << std::endl;
+        std::cout << "块大小: " << current_chunk_mb << " MB" << std::endl;
+        std::cout << "调整因子: " << std::setprecision(3) << adjustment_factor << std::endl;
+        std::cout << "已分配: " << (total_allocated.load() / (1024*1024)) << " MB" << std::endl;
+        std::cout << "可用内存: " << (mem.available / 1024) << " MB" << std::endl;
+        
+        // 显示进度条
+        show_progress_bar(mem.usage_percent);
+    }
+    
+    void show_progress_bar(double usage) {
+        int bar_width = 40;
+        int pos = static_cast<int>(bar_width * usage / 100.0);
+        
+        std::cout << "[";
+        for (int i = 0; i < bar_width; ++i) {
+            if (i < pos) {
+                if (i < bar_width * TARGET_PERCENT / 100) {
+                    std::cout << "\033[1;32m█\033[0m";  // 绿色
+                } else {
+                    std::cout << "\033[1;33m█\033[0m";  // 黄色
+                }
+            } else {
+                std::cout << " ";
+            }
+        }
+        std::cout << "] " << std::setw(5) << usage << "%" << std::endl;
+    }
+};
+
+// 多进程智能控制器
+class MultiProcessSmartController {
+private:
+    std::vector<pid_t> child_pids;
+    std::vector<std::thread> monitor_threads;
+    std::atomic<bool> running{true};
+    int num_processes = 4;
+    
+public:
+    MultiProcessSmartController(int n = 4) : num_processes(n) {}
+    
+    void start() {
+        std::cout << "\033[1;34m" << std::string(60, '=') << "\033[0m" << std::endl;
+        std::cout << "\033[1;34m       多进程智能内存控制器启动        \033[0m" << std::endl;
+        std::cout << "\033[1;34m目标: 将内存使用率维持在" << TARGET_PERCENT << "% ±" << TOLERANCE << "%\033[0m" << std::endl;
+        std::cout << "\033[1;34m进程数: " << num_processes << "\033[0m" << std::endl;
+        std::cout << "\033[1;34m" << std::string(60, '=') << "\033[0m" << std::endl;
+        
+        // 创建子进程
+        for (int i = 0; i < num_processes; i++) {
+            pid_t pid = fork();
+            
+            if (pid == 0) {  // 子进程
+                child_process(i);
+            } else if (pid > 0) {  // 父进程
+                child_pids.push_back(pid);
+                std::cout << "启动智能进程 " << i << " (PID: " << pid << ")" << std::endl;
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
+        }
+        
+        // 启动系统监控
+        std::thread system_monitor(&MultiProcessSmartController::monitor_system, this);
+        
+        // 等待用户输入
+        std::cout << "\n\033[1;33m按 Enter 键停止所有进程...\033[0m" << std::endl;
+        std::cin.get();
+        
+        stop();
+        
+        if (system_monitor.joinable()) {
+            system_monitor.join();
+        }
+    }
+    
+private:
+    void child_process(int id) {
+        // 每个进程有不同的初始参数
+        SmartMemoryAllocator allocator;
+        
+        // 运行直到父进程停止
+        while (running) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        
+        exit(0);
+    }
+    
+    void monitor_system() {
+        int report_count = 0;
+        
+        while (running) {
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            report_count++;
+            
+            MemoryInfo mem;
+            if (mem.read()) {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                
+                std::cout << "\n\033[1;37m" << std::string(50, '=') << "\033[0m" << std::endl;
+                std::cout << "\033[1;37m[系统监控 #" << report_count << "]\033[0m" << std::endl;
+                
+                // 显示详细内存信息
+                std::cout << std::fixed << std::setprecision(1);
+                std::cout << "总内存: " << (mem.total / 1024 / 1024) << " GB" << std::endl;
+                std::cout << "可用内存: " << (mem.available / 1024) << " MB" << std::endl;
+                std::cout << "空闲内存: " << (mem.free / 1024) << " MB" << std::endl;
+                std::cout << "缓存: " << (mem.cached / 1024) << " MB" << std::endl;
+                std::cout << "缓冲区: " << (mem.buffers / 1024) << " MB" << std::endl;
+                std::cout << "使用率: " << mem.usage_percent << "%" << std::endl;
+                
+                // 状态评估
+                if (std::abs(mem.usage_percent - TARGET_PERCENT) <= TOLERANCE) {
+                    std::cout << "\033[1;32m状态: 正常 (在目标范围内)\033[0m" << std::endl;
+                } else if (mem.usage_percent < TARGET_PERCENT - TOLERANCE) {
+                    std::cout << "\033[1;33m状态: 偏低 (需要增加内存使用)\033[0m" << std::endl;
+                } else {
+                    std::cout << "\033[1;31m状态: 偏高 (需要减少内存使用)\033[0m" << std::endl;
+                }
+                
+                // 运行free命令
+                std::cout << "\n当前系统状态:" << std::endl;
+                system("free -h | head -2");
+            }
+        }
+    }
+    
+    void stop() {
+        running = false;
+        
+        std::cout << "\n\033[1;33m正在停止所有进程...\033[0m" << std::endl;
+        for (pid_t pid : child_pids) {
+            if (pid > 0) {
+                kill(pid, SIGTERM);
+            }
+        }
+        
+        for (pid_t pid : child_pids) {
+            if (pid > 0) {
+                waitpid(pid, nullptr, 0);
+            }
+        }
+        
+        std::cout << "\033[1;32m所有进程已停止\033[0m" << std::endl;
+    }
+};
+
+// 主程序
+int main(int argc, char* argv[]) {
+    int num_processes = 4;
+    
+    if (argc > 1) {
+        num_processes = atoi(argv[1]);
+        num_processes = std::max(1, std::min(8, num_processes));  // 限制1-8个进程
+    }
+    
+    std::cout << "\033[1;35m智能内存压力测试系统\033[0m" << std::endl;
+    std::cout << "目标: 维持内存使用率在" << TARGET_PERCENT << "%左右" << std::endl;
+    std::cout << "使用PID控制算法动态调整内存分配" << std::endl;
+    std::cout << "按Ctrl+C可随时中断\n" << std::endl;
+    
+    // 单进程版本
+    std::cout << "选择模式:" << std::endl;
+    std::cout << "1) 单进程智能控制" << std::endl;
+    std::cout << "2) 多进程智能控制 (" << num_processes << "进程)" << std::endl;
+    std::cout << "请选择: ";
+    
+    int choice;
+    std::cin >> choice;
+    std::cin.ignore();  // 清除换行符
+    
+    if (choice == 1) {
+        // 单进程模式
+        std::cout << "\n启动单进程智能控制器..." << std::endl;
+        SmartMemoryAllocator allocator;
+        
+        std::cout << "按 Enter 键停止..." << std::endl;
+        std::cin.get();
+        
+        allocator.stop();
+    } else {
+        // 多进程模式
+        MultiProcessSmartController controller(num_processes);
+        controller.start();
+    }
+    
+    std::cout << "\n\033[1;32m测试完成\033[0m" << std::endl;
+    return 0;
+}
+

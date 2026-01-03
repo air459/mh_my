@@ -1,0 +1,268 @@
+// bomber_8_process_fixed.cpp
+#include <iostream>
+#include <vector>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <cstdlib>
+#include <cstdio>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <csignal>
+#include <mutex>
+#include <iomanip>
+#include <fstream>  // 添加缺失的头文件
+#include <functional>  // 添加function头文件
+
+std::mutex g_output_mutex;
+const int NUM_PROCESSES = 8;  // 固定8个进程
+
+// 全局信号处理器
+volatile sig_atomic_t stop_flag = 0;
+void signal_handler(int sig) {
+    stop_flag = 1;
+}
+
+// 打印彩色输出
+void print_colored(const std::string& msg, int color = 37) {
+    std::lock_guard<std::mutex> lock(g_output_mutex);
+    std::cout << "\033[1;" << color << "m" << msg << "\033[0m" << std::endl;
+}
+
+// 子进程工作函数
+void worker_process(int proc_id, int threads_per_proc, int chunk_mb, int max_iter) {
+    // 忽略中断信号
+    signal(SIGINT, SIG_IGN);
+    
+    std::vector<std::thread> threads;
+    std::atomic<long long> total_allocated{0};
+    std::atomic<int> allocations_count{0};
+    std::atomic<bool> stop_flag{false};
+    
+    // 计算每个进程的块大小（逐渐增加）
+    int adjusted_chunk_mb = chunk_mb;
+    if (proc_id >= 4) {  // 后4个进程使用更大块
+        adjusted_chunk_mb = chunk_mb * 2;
+    }
+    
+    print_colored("[进程" + std::to_string(proc_id) + "] 启动: " + 
+                 std::to_string(threads_per_proc) + "线程, " + 
+                 std::to_string(adjusted_chunk_mb) + "MB/块", 32 + proc_id % 6);
+    
+    // 工作线程函数
+    auto thread_func = [proc_id, adjusted_chunk_mb, max_iter, &total_allocated, &allocations_count, &stop_flag](int thread_id) {
+        size_t chunk_size = adjusted_chunk_mb * 1024ULL * 1024ULL;
+        int iteration = 0;
+        
+        while (!stop_flag && (max_iter == 0 || iteration < max_iter)) {
+            char* block = new (std::nothrow) char[chunk_size];
+            if (!block) {
+                {
+                    std::lock_guard<std::mutex> lock(g_output_mutex);
+                    std::cout << "\033[1;31m[进程" << proc_id << "线程" << thread_id << "] 内存不足!\033[0m" << std::endl;
+                }
+                break;
+            }
+            
+            // 写入数据确保占用物理内存
+            memset(block, (proc_id + thread_id + iteration) % 256, chunk_size);
+            
+            total_allocated += chunk_size;
+            allocations_count++;
+            iteration++;
+            
+            // 定期报告
+            if (iteration % 5 == 0) {
+                long long mb = total_allocated.load() / (1024*1024);
+                std::lock_guard<std::mutex> lock(g_output_mutex);
+                std::cout << "\033[1;36m[P" << proc_id << "T" << thread_id << "] 迭代: " << iteration 
+                         << ", 分配: " << mb << " MB\033[0m" << std::endl;
+            }
+            
+            // 不同线程不同延迟
+            int delay = 1 + (proc_id + thread_id) % 3;
+            std::this_thread::sleep_for(std::chrono::seconds(delay));
+        }
+    };
+    
+    // 启动工作线程
+    for (int i = 0; i < threads_per_proc; i++) {
+        threads.emplace_back(thread_func, i);
+    }
+    
+    // 监控报告线程
+    std::thread reporter([proc_id, &total_allocated, &stop_flag]() {
+        while (!stop_flag) {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            long long mb = total_allocated.load() / (1024*1024);
+            
+            std::lock_guard<std::mutex> lock(g_output_mutex);
+            std::cout << "\033[1;33m[进程" << proc_id << "监控] 总计: " 
+                     << std::setw(8) << mb << " MB (" 
+                     << std::setw(6) << std::fixed << std::setprecision(2) 
+                     << (mb / 1024.0) << " GB)\033[0m" << std::endl;
+        }
+    });
+    
+    // 等待工作线程
+    for (auto& t : threads) {
+        t.join();
+    }
+    
+    stop_flag = true;
+    reporter.join();
+    
+    {
+        std::lock_guard<std::mutex> lock(g_output_mutex);
+        std::cout << "\033[1;35m[进程" << proc_id << "完成] 总分配: " 
+                 << (total_allocated.load() / (1024*1024)) << " MB, " 
+                 << allocations_count.load() << " 次分配\033[0m" << std::endl;
+    }
+    
+    exit(0);
+}
+
+int main(int argc, char* argv[]) {
+    int threads_per_process = 2;     // 每个进程2个线程
+    int chunk_mb = 256;              // 基础块大小
+    int max_iterations = 0;          // 0表示无限
+    
+    if (argc > 1) threads_per_process = atoi(argv[1]);
+    if (argc > 2) chunk_mb = atoi(argv[2]);
+    if (argc > 3) max_iterations = atoi(argv[3]);
+    
+    std::cout << "\033[1;34m" << std::string(60, '=') << "\033[0m" << std::endl;
+    std::cout << "\033[1;34m             8进程内存轰炸系统启动              \033[0m" << std::endl;
+    std::cout << "\033[1;34m" << std::string(60, '=') << "\033[0m" << std::endl;
+    std::cout << "配置:" << std::endl;
+    std::cout << "  • 进程数: " << NUM_PROCESSES << " (固定)" << std::endl;
+    std::cout << "  • 每进程线程数: " << threads_per_process << std::endl;
+    std::cout << "  • 块大小: " << chunk_mb << " MB" << std::endl;
+    std::cout << "  • 后4个进程: " << (chunk_mb * 2) << " MB" << std::endl;
+    std::cout << "  • 最大迭代: " << (max_iterations == 0 ? "无限" : std::to_string(max_iterations)) << std::endl;
+    std::cout << "\033[1;34m" << std::string(60, '=') << "\033[0m" << std::endl;
+    
+    std::vector<pid_t> pids(NUM_PROCESSES);
+    
+    // 创建8个子进程
+    for (int i = 0; i < NUM_PROCESSES; i++) {
+        pid_t pid = fork();
+        
+        if (pid == 0) {  // 子进程
+            worker_process(i, threads_per_process, chunk_mb, max_iterations);
+        } else if (pid > 0) {  // 父进程
+            pids[i] = pid;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));  // 延迟启动
+        } else {
+            std::cerr << "\033[1;31m创建进程 " << i << " 失败!\033[0m" << std::endl;
+        }
+    }
+    
+    // 设置信号处理器
+    signal(SIGINT, signal_handler);
+    
+    // 系统监控函数
+    auto system_monitor = [&pids]() {
+        long long last_total = 0;
+        int report_count = 0;
+        
+        while (!stop_flag) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            report_count++;
+            
+            // 检查进程状态
+            int alive_count = 0;
+            for (int i = 0; i < NUM_PROCESSES; i++) {
+                if (pids[i] > 0 && kill(pids[i], 0) == 0) {
+                    alive_count++;
+                }
+            }
+            
+            // 显示系统状态
+            std::ifstream meminfo("/proc/meminfo");
+            std::string line;
+            long long mem_free = 0, mem_available = 0;
+            
+            if (meminfo.is_open()) {
+                while (getline(meminfo, line)) {
+                    if (line.find("MemFree:") == 0) {
+                        std::string value = line.substr(8);
+                        mem_free = std::stoll(value);
+                    } else if (line.find("MemAvailable:") == 0) {
+                        std::string value = line.substr(13);
+                        mem_available = std::stoll(value);
+                    }
+                }
+                meminfo.close();
+            }
+            
+            std::lock_guard<std::mutex> lock(g_output_mutex);
+            std::cout << "\n\033[1;37m" << std::string(60, '-') << "\033[0m" << std::endl;
+            std::cout << "\033[1;37m[系统监控 #" << report_count << "]\033[0m" << std::endl;
+            std::cout << "  活动进程: " << alive_count << "/" << NUM_PROCESSES << std::endl;
+            std::cout << "  可用内存: " << (mem_available / 1024) << " MB" << std::endl;
+            std::cout << "  空闲内存: " << (mem_free / 1024) << " MB" << std::endl;
+            
+            // 执行free命令
+            std::cout << "\n  当前内存状态:" << std::endl;
+            system("free -h | sed 's/^/    /'");
+            
+            std::cout << "\033[1;37m" << std::string(60, '-') << "\033[0m\n" << std::endl;
+            
+            if (alive_count == 0) {
+                std::cout << "\033[1;31m所有进程已完成!\033[0m" << std::endl;
+                break;
+            }
+        }
+    };
+    
+    // 启动系统监控线程
+    std::thread monitor_thread(system_monitor);
+    
+    std::cout << "\n\033[1;32m所有8个进程已启动!\033[0m" << std::endl;
+    std::cout << "\033[1;33m按 Ctrl+C 停止所有进程\033[0m" << std::endl;
+    std::cout << "\033[1;33m按 Enter 键立即停止\033[0m" << std::endl;
+    std::cout << "\033[1;37m" << std::string(60, '=') << "\033[0m" << std::endl;
+    
+    // 等待用户输入或信号
+    std::thread input_thread([&pids]() {
+        std::cin.get();
+        stop_flag = 1;
+    });
+    
+    // 等待停止标志
+    while (!stop_flag) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    
+    input_thread.detach();
+    
+    // 停止所有进程
+    std::cout << "\n\033[1;33m正在停止所有进程...\033[0m" << std::endl;
+    for (pid_t pid : pids) {
+        if (pid > 0) {
+            kill(pid, SIGTERM);
+            std::cout << "\033[1;33m停止进程 PID: " << pid << "\033[0m" << std::endl;
+        }
+    }
+    
+    // 等待进程结束
+    for (pid_t pid : pids) {
+        if (pid > 0) {
+            int status;
+            waitpid(pid, &status, 0);
+        }
+    }
+    
+    if (monitor_thread.joinable()) {
+        monitor_thread.join();
+    }
+    
+    std::cout << "\n\033[1;32m" << std::string(60, '=') << "\033[0m" << std::endl;
+    std::cout << "\033[1;32m            所有进程已安全停止             \033[0m" << std::endl;
+    std::cout << "\033[1;32m" << std::string(60, '=') << "\033[0m" << std::endl;
+    
+    return 0;
+}
+

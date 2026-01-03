@@ -1,0 +1,331 @@
+// fixed_multi_process_bomber.cpp
+#include <iostream>
+#include <vector>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <cstdlib>
+#include <cstdio>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <csignal>
+#include <mutex>
+#include <iomanip>
+#include <condition_variable>
+#include <memory>
+
+class ProcessBomber {
+private:
+    struct ProcessInfo {
+        pid_t pid = 0;
+        int process_id = 0;
+        int pipe_fd[8] = {-1, -1};
+        std::atomic<long long> allocated{0};
+        
+        // 禁止拷贝构造函数
+        ProcessInfo() = default;
+        ProcessInfo(const ProcessInfo&) = delete;
+        ProcessInfo& operator=(const ProcessInfo&) = delete;
+        
+        // 允许移动构造函数
+        ProcessInfo(ProcessInfo&& other) noexcept 
+            : pid(other.pid), 
+              process_id(other.process_id), 
+              allocated(other.allocated.load()) {
+            pipe_fd[0] = other.pipe_fd[0];
+            pipe_fd[1] = other.pipe_fd[1];
+            other.pipe_fd[0] = -1;
+            other.pipe_fd[1] = -1;
+            other.pid = 0;
+        }
+        
+        ProcessInfo& operator=(ProcessInfo&& other) noexcept {
+            if (this != &other) {
+                close_pipes();
+                pid = other.pid;
+                process_id = other.process_id;
+                allocated = other.allocated.load();
+                pipe_fd[0] = other.pipe_fd[0];
+                pipe_fd[1] = other.pipe_fd[1];
+                other.pipe_fd[0] = -1;
+                other.pipe_fd[1] = -1;
+                other.pid = 0;
+            }
+            return *this;
+        }
+        
+        ~ProcessInfo() {
+            close_pipes();
+        }
+        
+    private:
+        void close_pipes() {
+            if (pipe_fd[0] != -1) {
+                close(pipe_fd[0]);
+                pipe_fd[0] = -1;
+            }
+            if (pipe_fd[1] != -1) {
+                close(pipe_fd[1]);
+                pipe_fd[1] = -1;
+            }
+        }
+    };
+    
+    std::atomic<bool> running{true};
+    std::vector<std::unique_ptr<ProcessInfo>> processes;
+    std::mutex cout_mutex;
+    std::thread monitor_thread;
+    
+    // 子进程函数
+    void child_process(int process_id, int num_threads, size_t chunk_mb, 
+                      int max_iterations, int write_fd) {
+        // 设置非阻塞写入
+        int flags = fcntl(write_fd, F_GETFL, 0);
+        fcntl(write_fd, F_SETFL, flags | O_NONBLOCK);
+        
+        std::vector<std::thread> threads;
+        std::atomic<long long> child_total{0};
+        std::atomic<bool> child_running{true};
+        
+        // 设置信号处理
+        struct sigaction sa;
+        sa.sa_handler = [](int) {};
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+        sigaction(SIGINT, &sa, nullptr);
+        
+        // 工作线程函数
+        auto worker_func = [&](int thread_id) {
+            size_t chunk_size = chunk_mb * 1024 * 1024;
+            int iteration = 0;
+            
+            while (child_running && (max_iterations == 0 || iteration < max_iterations)) {
+                char* block = new (std::nothrow) char[chunk_size];
+                if (!block) {
+                    {
+                        std::lock_guard<std::mutex> lock(cout_mutex);
+                        std::cerr << "进程" << process_id << "线程" << thread_id 
+                                << ": 内存不足!" << std::endl;
+                    }
+                    break;
+                }
+                
+                // 写入数据确保实际占用内存
+                memset(block, (process_id + thread_id + iteration) % 256, chunk_size);
+                
+                long long current = child_total += chunk_size;
+                iteration++;
+                
+                // 定期向父进程报告
+                if (thread_id == 0 && iteration % 5 == 0) {
+                    char buffer[64];
+                    snprintf(buffer, sizeof(buffer), "P%d:%lld\n", 
+                            process_id, current / (1024*1024));
+                    write(write_fd, buffer, strlen(buffer));
+                    
+                    std::lock_guard<std::mutex> lock(cout_mutex);
+                    std::cout << "进程" << process_id << " 分配: " 
+                            << (current / (1024*1024)) << " MB" 
+                            << " (迭代: " << iteration << ")" << std::endl;
+                }
+                
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+        };
+        
+        // 启动工作线程
+        for (int i = 0; i < num_threads; i++) {
+            threads.emplace_back(worker_func, i);
+        }
+        
+        // 等待工作线程
+        for (auto& t : threads) {
+            t.join();
+        }
+        
+        child_running = false;
+        close(write_fd);
+        exit(0);
+    }
+    
+    // 监控函数
+    void monitor_processes() {
+        while (running) {
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            show_status();
+        }
+    }
+    
+    void show_status() {
+        std::lock_guard<std::mutex> lock(cout_mutex);
+        std::cout << "\n======= 系统状态 =======" << std::endl;
+        
+        long long total_mb = 0;
+        for (size_t i = 0; i < processes.size(); i++) {
+            if (auto& proc = processes[i]) {
+                long long mb = proc->allocated.load() / (1024*1024);
+                total_mb += mb;
+                std::cout << "进程" << i << " (PID: " << proc->pid 
+                         << "): " << std::setw(8) << mb << " MB" << std::endl;
+            }
+        }
+        
+        std::cout << "-----------------------" << std::endl;
+        std::cout << "总计:    " << std::setw(8) << total_mb << " MB" << std::endl;
+        std::cout << "         " << std::setw(8) << (total_mb / 1024.0) << " GB" << std::endl;
+        std::cout << "========================\n" << std::endl;
+    }
+    
+    // 从管道读取进程状态
+    void read_from_pipes() {
+        for (auto& proc : processes) {
+            if (!proc || proc->pipe_fd[0] == -1) continue;
+            
+            char buffer[256];
+            ssize_t n;
+            while ((n = read(proc->pipe_fd[0], buffer, sizeof(buffer) - 1)) > 0) {
+                buffer[n] = '\0';
+                char* line = buffer;
+                char* next_line;
+                
+                while ((next_line = strchr(line, '\n'))) {
+                    *next_line = '\0';
+                    
+                    int pid;
+                    long long mb;
+                    if (sscanf(line, "P%d:%lld", &pid, &mb) == 2) {
+                        if (proc && proc->process_id == pid) {
+                            proc->allocated = mb * 1024 * 1024;
+                        }
+                    }
+                    
+                    line = next_line + 1;
+                }
+            }
+        }
+    }
+    
+public:
+    void start(int num_processes, int threads_per_process, 
+               size_t chunk_mb, int max_iterations) {
+        
+        std::cout << "=== 多进程内存轰炸器 ===" << std::endl;
+        std::cout << "进程数: " << num_processes << std::endl;
+        std::cout << "每进程线程数: " << threads_per_process << std::endl;
+        std::cout << "块大小: " << chunk_mb << " MB" << std::endl;
+        std::cout << "最大迭代: " << max_iterations 
+                  << (max_iterations == 0 ? " (无限)" : "") << std::endl;
+        std::cout << "按 Ctrl+C 停止\n" << std::endl;
+        
+        // 创建子进程
+        for (int i = 0; i < num_processes; i++) {
+            auto proc = std::make_unique<ProcessInfo>();
+            proc->process_id = i;
+            
+            // 创建管道
+            if (pipe(proc->pipe_fd) == -1) {
+                std::cerr << "创建管道失败!" << std::endl;
+                continue;
+            }
+            
+            // 创建子进程
+            pid_t pid = fork();
+            if (pid == 0) {  // 子进程
+                close(proc->pipe_fd[0]);  // 关闭读端
+                child_process(i, threads_per_process, chunk_mb, max_iterations, 
+                            proc->pipe_fd[1]);
+            } else if (pid > 0) {  // 父进程
+                proc->pid = pid;
+                close(proc->pipe_fd[1]);  // 关闭写端
+                processes.push_back(std::move(proc));
+                
+                std::cout << "启动进程 " << i << " (PID: " << pid << ")" << std::endl;
+            } else {
+                std::cerr << "创建进程失败!" << std::endl;
+                close(proc->pipe_fd[0]);
+                close(proc->pipe_fd[1]);
+            }
+        }
+        
+        // 启动监控线程
+        monitor_thread = std::thread([this]() {
+            while (running) {
+                read_from_pipes();
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        });
+        
+        // 等待用户中断
+        std::cout << "\n按 Enter 键停止所有进程..." << std::endl;
+        std::cin.get();
+        
+        stop();
+    }
+    
+    void stop() {
+        running = false;
+        
+        // 发送信号给子进程
+        for (auto& proc : processes) {
+            if (proc && proc->pid > 0) {
+                kill(proc->pid, SIGTERM);
+            }
+        }
+        
+        // 等待子进程退出
+        for (auto& proc : processes) {
+            if (proc && proc->pid > 0) {
+                int status;
+                waitpid(proc->pid, &status, 0);
+            }
+        }
+        
+        if (monitor_thread.joinable()) {
+            monitor_thread.join();
+        }
+        
+        processes.clear();
+        std::cout << "所有进程已停止" << std::endl;
+    }
+    
+    ~ProcessBomber() {
+        stop();
+    }
+};
+
+int main(int argc, char* argv[]) {
+    int num_processes = 2;
+    int threads_per_process = 2;
+    int chunk_mb = 100;
+    int max_iterations = 10;
+    
+    if (argc > 1) num_processes = atoi(argv[1]);
+    if (argc > 2) threads_per_process = atoi(argv[2]);
+    if (argc > 3) chunk_mb = atoi(argv[3]);
+    if (argc > 4) max_iterations = atoi(argv[4]);
+    
+    ProcessBomber bomber;
+    
+    // 设置信号处理
+    struct sigaction sa;
+    sa.sa_handler = [](int) {
+        std::cout << "\n收到中断信号，正在停止..." << std::endl;
+        exit(0);
+    };
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, nullptr);
+    
+    try {
+        bomber.start(num_processes, threads_per_process, chunk_mb, max_iterations);
+    } catch (const std::exception& e) {
+        std::cerr << "错误: " << e.what() << std::endl;
+        return 1;
+    }
+    
+    return 0;
+}
+

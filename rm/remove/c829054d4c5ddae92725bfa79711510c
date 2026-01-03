@@ -1,0 +1,24 @@
+// 保存为 ram_fill.cpp
+// 编译: g++ -o ram_fill ram_fill.cpp
+#include <cstdlib>
+#include <cstdio>
+#include <unistd.h>
+#include <cstring>
+
+int main() {
+    size_t mb = 1024 * 1024;
+    int i = 0;
+    char *ptr;
+    
+    while(1) {
+        ptr = (char*)malloc(mb);
+        if(ptr == NULL) break;
+        for(size_t j = 0; j < mb; j++)
+            ptr[j] = (char)(rand() % 256);
+        i++;
+        printf("已分配: %d MB\n", i);
+        sleep(1);
+    }
+    return 0;
+}
+
